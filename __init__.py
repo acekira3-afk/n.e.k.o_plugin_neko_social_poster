@@ -3,12 +3,15 @@
 让猫娘用 Computer Use Agent（VLM + pyautogui）操作桌面，
 在微博网页版发布动态。P0 MVP：手动触发、单平台、纯文字。
 
-工作流程：
+工作流程（含强制确认门）：
 1. 用户说"帮我发一条微博"
-2. LLM 调用 generate_weibo_content 生成候选内容，展示给用户确认
-3. 用户确认后，LLM 调用 post_weibo 执行 CUA 发布
+2. LLM 调用 generate_weibo_content 生成候选内容
+3. LLM 向用户展示内容并问"可以发吗？"
+4. 用户确认后，LLM 调用 post_weibo(content=..., confirmed=True)
+5. 插件检查 require_confirm 配置 + confirmed 参数，通过后执行 CUA
 
 安全护栏：
+- require_confirm=true 时，必须 confirmed=True 才执行 CUA
 - CUA 执行在独立线程，不阻塞事件循环
 - 任务 prompt 明确限制在"打开微博→输入内容→点击发布"范围
 - CUA 内部 max_steps=30，防止无限循环
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import threading
 from typing import Any, Dict, Optional
 
 from plugin.sdk.plugin import (
@@ -109,7 +113,6 @@ def _generate_content(**ctx: Any) -> str:
     P0 先做随机模板。
     """
     template = random.choice(_CONTENT_TEMPLATES)
-    # 用简单的占位符替换，不依赖外部数据
     placeholders = {
         "weather": random.choice(_WEATHER_WORDS),
         "times": random.choice(["3", "5", "12", "好多"]),
@@ -142,6 +145,7 @@ class NekoSocialPosterPlugin(NekoPluginBase):
     def __init__(self, ctx: Any):
         super().__init__(ctx)
         self._cua: Optional[Any] = None
+        self._cua_lock = threading.Lock()
         self._config: Dict[str, Any] = {}
 
     @lifecycle(id="startup")
@@ -154,22 +158,32 @@ class NekoSocialPosterPlugin(NekoPluginBase):
         except Exception as e:
             self.logger.warning("failed to load plugin config: %s", e)
 
-    # ── CUA 懒加载 ──────────────────────────────────────────────────────
+    # ── CUA 缓存与懒加载 ────────────────────────────────────────────────
 
     def _get_cua(self) -> Optional[Any]:
-        """按需构造 ComputerUseAdapter。
+        """获取或构造 ComputerUseAdapter。
 
-        每次发动态都新建实例，因为 ComputerUseAdapter 内部有会话状态
-        (_current_session_id, actions, observations)，不复用更安全。
+        CUA 构造成本高（加载 pyautogui、探测屏幕尺寸、创建 LLM 客户端），
+        所以缓存实例。但每次 run_instruction 会写入会话状态（actions、
+        observations、_current_session_id），需要在调用前 reset。
         """
         if not _CUA_AVAILABLE or _ComputerUseAdapter is None:
             return None
-        try:
-            max_steps = int(self._config.get("max_steps", 30))
-            return _ComputerUseAdapter(max_steps=max_steps)
-        except Exception as e:
-            self.logger.error("failed to construct ComputerUseAdapter: %s", e)
-            return None
+
+        with self._cua_lock:
+            if self._cua is not None:
+                return self._cua
+            try:
+                max_steps = int(self._config.get("max_steps", 30))
+                cua = _ComputerUseAdapter(max_steps=max_steps)
+                if not getattr(cua, "init_ok", True) and getattr(cua, "last_error", None):
+                    self.logger.warning("CUA init failed: %s", cua.last_error)
+                    return None
+                self._cua = cua
+                return cua
+            except Exception as e:
+                self.logger.error("failed to construct ComputerUseAdapter: %s", e)
+                return None
 
     # ── Plugin Entries ──────────────────────────────────────────────────
 
@@ -199,7 +213,7 @@ class NekoSocialPosterPlugin(NekoPluginBase):
         name=tr("entry.weibo_post.name", default="发微博"),
         description=tr(
             "entry.weibo_post.description",
-            default="让猫娘用 Computer Use Agent 在微博网页版发布一条动态。需要用户已在浏览器中登录微博账号。content 参数为要发布的文字内容。",
+            default="让猫娘用 Computer Use Agent 在微博网页版发布一条动态。需要用户已在浏览器中登录微博账号。content 为要发布的文字内容，confirmed 必须为 true 才会真正执行（确认门）。",
         ),
         input_schema={
             "type": "object",
@@ -211,21 +225,25 @@ class NekoSocialPosterPlugin(NekoPluginBase):
                         default="要发布的微博文字内容（必填）",
                     ),
                 },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "用户是否已确认发布。require_confirm=true 时必须显式传 true",
+                    "default": False,
+                },
             },
             "required": ["content"],
         },
-        llm_result_fields=["success", "content", "steps", "message"],
+        llm_result_fields=["success", "content", "steps", "message", "status"],
     )
-    async def post_weibo(self, content: str, **_) -> Any:
+    async def post_weibo(self, content: str, confirmed: bool = False, **_) -> Any:
         """在微博网页版发布指定内容。
 
-        流程：
-        1. 校验 content 非空
-        2. 推送"正在操作"提示到聊天
-        3. 在独立线程中运行 CUA（run_instruction 是阻塞的）
-        4. 返回执行结果
+        确认门逻辑：
+        - plugin.toml 中 require_confirm=true（默认）时，confirmed 必须为 True
+        - confirmed=False 时，推送确认消息到聊天，返回 status="awaiting_confirmation"
+        - confirmed=True 时，执行 CUA 发布
 
-        CUA 执行期间会周期性截图 + VLM 推理，总耗时通常 15-60 秒。
+        CUA 执行在独立线程，run_instruction 通常 15-60 秒。
         """
         content = (content or "").strip()
         if not content:
@@ -234,18 +252,39 @@ class NekoSocialPosterPlugin(NekoPluginBase):
                 default="content 不能为空",
             )))
 
+        require_confirm = bool(self._config.get("require_confirm", True))
+
+        # ── 确认门：未确认则拦截 ────────────────────────────────────────
+        if require_confirm and not confirmed:
+            try:
+                self.push_message(
+                    source="neko_social_poster",
+                    visibility=["chat"],
+                    ai_behavior="respond",
+                    parts=[{
+                        "type": "text",
+                        "text": tr(
+                            "entry.weibo_post.confirm_prompt",
+                            default="主人，我想发这条微博，可以吗？\n\n「{content}」\n\n（确认后我会在你的电脑上打开微博网页版并发布）",
+                            content=content,
+                        ),
+                    }],
+                    priority=6,
+                )
+            except Exception:
+                pass
+            return Ok({
+                "status": "awaiting_confirmation",
+                "content": content,
+                "message": "已推送确认请求，等待用户确认后再次调用 post_weibo 并传入 confirmed=true",
+            })
+
         # ── 1. 检查 CUA 可用性 ──────────────────────────────────────────
         cua = self._get_cua()
         if cua is None:
             return Err(SdkError(tr(
                 "entry.weibo_post.error.cua_not_available",
                 default="Computer Use Agent 不可用。请确认：\n1. N.E.K.O 主程序已启动\n2. Agent 模型已在设置中配置\n3. pyautogui 可用（macOS 需授权辅助功能）",
-            )))
-
-        if not getattr(cua, "init_ok", True) and getattr(cua, "last_error", None):
-            return Err(SdkError(tr(
-                "entry.weibo_post.error.cua_not_available",
-                default=f"Computer Use Agent 初始化失败：{cua.last_error}",
             )))
 
         # ── 2. 推送"正在执行"提示 ───────────────────────────────────────
@@ -312,6 +351,7 @@ class NekoSocialPosterPlugin(NekoPluginBase):
                 },
             )
             return Ok({
+                "status": "success",
                 "success": True,
                 "content": content,
                 "steps": steps,
@@ -334,6 +374,7 @@ class NekoSocialPosterPlugin(NekoPluginBase):
                 priority=7,
             )
             return Ok({
+                "status": "failed",
                 "success": False,
                 "content": content,
                 "steps": steps,
