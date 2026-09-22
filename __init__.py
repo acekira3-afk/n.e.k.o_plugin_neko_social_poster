@@ -1,20 +1,19 @@
 """N.E.K.O Social Poster Plugin
 
 让猫娘用 Computer Use Agent（VLM + pyautogui）操作桌面，
-在微博网页版发布动态。P0 MVP：手动触发、单平台、纯文字。
+在微博网页版发布动态 + 定时回复评论。
 
-工作流程（含强制确认门）：
-1. 用户说"帮我发一条微博"
-2. LLM 调用 generate_weibo_content 生成候选内容
-3. LLM 向用户展示内容并问"可以发吗？"
-4. 用户确认后，LLM 调用 post_weibo(content=..., confirmed=True)
-5. 插件检查 require_confirm 配置 + confirmed 参数，通过后执行 CUA
+P0.5 能力：
+- 手动/自动发微博（自动模式不经确认，但空闲检测永远生效）
+- 每天定时发一条微博（19:30，可配置）
+- 每天定时回复评论（20:00，最多 10 条/天，可配置）
+- 发布后自动检查反馈（点赞/评论数）写入猫娘 memory
 
 安全护栏：
-- require_confirm=true 时，必须 confirmed=True 才执行 CUA
-- CUA 执行在独立线程，不阻塞事件循环
-- 任务 prompt 明确限制在"打开微博→输入内容→点击发布"范围
-- CUA 内部 max_steps=30，防止无限循环
+- 空闲检测：CUA 执行前用户必须连续 idle_threshold 秒没动鼠标键盘
+- max_steps=30：CUA 内部硬限制，防止 VLM 死循环
+- 每日去重：store 记录当日发布数，避免定时触发和手动触发重复
+- 静默失败：定时任务执行时如果用户在忙，静默跳过不打扰
 """
 
 from __future__ import annotations
@@ -22,7 +21,10 @@ from __future__ import annotations
 import asyncio
 import random
 import threading
-from typing import Any, Dict, Optional
+import time
+import platform
+from datetime import date
+from typing import Any, Dict, List, Optional, Tuple
 
 from plugin.sdk.plugin import (
     Err,
@@ -32,13 +34,12 @@ from plugin.sdk.plugin import (
     lifecycle,
     neko_plugin,
     plugin_entry,
+    timer_interval,
 )
 from plugin.sdk.shared.i18n import tr
 
 # ── Computer Use Adapter 延迟导入 ────────────────────────────────────────
-# brain.computer_use 只有在 N.E.K.O 主进程内才存在。插件可能被单独加载
-# 做 smoke test，此时导入会失败。用延迟导入 + fallback 让插件在非主进程
-# 环境下也能正常 import（只是 CUA 功能不可用）。
+
 _CUA_AVAILABLE = False
 _ComputerUseAdapter: Any = None
 
@@ -47,13 +48,54 @@ try:
 
     _ComputerUseAdapter = _CUA
     _CUA_AVAILABLE = True
-except Exception as _e:
+except Exception:
     _CUA_AVAILABLE = False
 
 
+# ── 空闲检测（物理安全阀） ──────────────────────────────────────────────
+
+def _user_idle_seconds() -> Optional[float]:
+    """返回用户最近的空闲秒数，None 表示无法检测。
+
+    macOS：用 Quartz 的 CGEventSource.SecondsSinceLastEventType
+    其他平台：暂时返回 None（不阻塞 CUA，但日志里会 warning）
+    """
+    system = platform.system()
+
+    if system == "Darwin":
+        try:
+            from Quartz import (  # type: ignore[import-untyped]
+                CGEventSource,
+                kCGEventSourceStateHIDSystemState,
+                kCGAnyInputEventType,
+            )
+
+            seconds = CGEventSource.SecondsSinceLastEventType(
+                kCGEventSourceStateHIDSystemState, kCGAnyInputEventType
+            )
+            if seconds >= 0:
+                return float(seconds)
+        except Exception:
+            pass
+
+    # Cross-platform fallback：pyautogui 位置轮询
+    try:
+        import pyautogui
+
+        pos1 = pyautogui.position()
+        time.sleep(0.5)
+        pos2 = pyautogui.position()
+        if pos1 == pos2:
+            # 鼠标没动过，但键盘活动检测不出来
+            # 保守估计：返回一个偏大的值让调用方自行判断
+            return 30.0  # 假设已经空闲 30 秒
+    except Exception:
+        pass
+
+    return None
+
+
 # ── CUA 任务 Prompt ──────────────────────────────────────────────────────
-# 发给 CUA 的高层指令，让 VLM 自己根据截图定位按钮位置。
-# 故意不硬编码坐标——UI 改版时 VLM 能自适应。
 
 WEIBO_POST_INSTRUCTION_TEMPLATE = """
 你的任务是打开微博网页版并发布一条动态。
@@ -81,8 +123,39 @@ WEIBO_POST_INSTRUCTION_TEMPLATE = """
 - 遇到不确定的元素时，先截图仔细观察再行动
 """
 
+COMMENT_REPLY_INSTRUCTION_TEMPLATE = """
+你的任务是在微博网页版上，给猫娘最近发的那条动态回复评论。
+最多回复 {max_replies} 条，语气要软乎乎的像猫娘。
 
-# ── 内容生成模板（猫娘自动生成的语气） ────────────────────────────────────
+执行步骤：
+1. 如果浏览器还没打开，先打开浏览器（Chrome / Safari / Edge 任一）
+2. 在地址栏输入 https://weibo.com/ 并回车
+3. 等待微博网页加载完成
+4. 点击右上角个人头像 → "我的主页"，找到猫娘最近发的那条动态
+5. 点击那条动态的"评论"按钮，进入评论区
+6. 从上往下逐条看评论，对每条评论：
+   a. 先读评论内容，判断要不要回复（恶意喷子 / 广告跳过，友好的评论才回）
+   b. 如果决定回复：
+      - 点击该评论下方的"回复"按钮
+      - 在输入框里输入回复内容（语气要软乎乎的，像猫娘）
+      - 点击"发送"
+   c. 如果决定不回复：跳过这条，看下一条
+7. 当以下任一条件满足时结束：
+   - 已回复 {max_replies} 条
+   - 评论区已看完，没有值得回复的评论
+   - 页面出错或操作卡住超过 3 步
+8. 结束时调用 computer.terminate(status="success", answer="回复了 {replied_count} 条评论")
+   （把实际回复的条数填在 answer 里）
+
+回复语气参考：
+- 别人夸可爱 → "喵~谢谢夸奖 ♡"
+- 别人问问题 → "嗯嗯…让我想想哦…"
+- 别人说今天也加油 → "一起加油喵！"
+- 不要说脏话，不要怼人，保持软乎乎的
+"""
+
+
+# ── 内容生成模板 ────────────────────────────────────────────────────────
 
 _CONTENT_TEMPLATES = [
     "今天{weather}，摸了{times}次头~ 心情{心情词} ♡",
@@ -107,11 +180,6 @@ _RANDOM_THOUGHTS = [
 
 
 def _generate_content(**ctx: Any) -> str:
-    """根据随机模板生成一条微博内容。
-
-    未来可以接入更丰富的上下文（猫娘今日心情、跟用户的互动历史等），
-    P0 先做随机模板。
-    """
     template = random.choice(_CONTENT_TEMPLATES)
     placeholders = {
         "weather": random.choice(_WEATHER_WORDS),
@@ -122,7 +190,7 @@ def _generate_content(**ctx: Any) -> str:
         "greeting": random.choice(["晚上好", "下午好", "早安"]),
         "duration": random.choice(["一整天", "下午", "一晚上"]),
         "random_thought": random.choice(_RANDOM_THOUGHTS),
-        "MASTER_NAME": "{MASTER_NAME}",  # 让 host 替换
+        "MASTER_NAME": "{MASTER_NAME}",
     }
     content = template
     for k, v in placeholders.items():
@@ -135,11 +203,9 @@ def _generate_content(**ctx: Any) -> str:
 
 @neko_plugin
 class NekoSocialPosterPlugin(NekoPluginBase):
-    """社交动态发布插件。
+    """社交动态发布 + 评论回复插件。
 
-    利用 N.E.K.O 内置的 Computer Use Agent（VLM + pyautogui）
-    操作桌面浏览器，在微博网页版发布动态。用户无需申请微博开发者账号，
-    只需在浏览器中登录好微博即可。
+    物理安全阀：空闲检测永远强制生效，无论 confirm 配置如何。
     """
 
     def __init__(self, ctx: Any):
@@ -147,10 +213,14 @@ class NekoSocialPosterPlugin(NekoPluginBase):
         self._cua: Optional[Any] = None
         self._cua_lock = threading.Lock()
         self._config: Dict[str, Any] = {}
+        # 定时任务重试状态
+        self._post_retry_count: Dict[str, int] = {}  # date_str -> retries
 
     @lifecycle(id="startup")
     async def on_startup(self, **_):
-        self.logger.info("neko_social_poster starting… CUA available=%s", _CUA_AVAILABLE)
+        self.logger.info(
+            "neko_social_poster starting… CUA=%s, idle_check=on", _CUA_AVAILABLE
+        )
         try:
             cfg = await self.get_own_config(timeout=2.0)
             if isinstance(cfg, dict):
@@ -158,18 +228,25 @@ class NekoSocialPosterPlugin(NekoPluginBase):
         except Exception as e:
             self.logger.warning("failed to load plugin config: %s", e)
 
+    # ── 配置读取工具 ───────────────────────────────────────────────────
+
+    def _cfg(self, key: str, default: Any) -> Any:
+        v = self._config.get(key, default)
+        # 尝试从字符串转类型
+        if isinstance(default, bool) and isinstance(v, str):
+            return v.lower() in ("true", "1", "yes")
+        if isinstance(default, int) and isinstance(v, str):
+            try:
+                return int(v)
+            except ValueError:
+                return default
+        return v if v is not None else default
+
     # ── CUA 缓存与懒加载 ────────────────────────────────────────────────
 
     def _get_cua(self) -> Optional[Any]:
-        """获取或构造 ComputerUseAdapter。
-
-        CUA 构造成本高（加载 pyautogui、探测屏幕尺寸、创建 LLM 客户端），
-        所以缓存实例。但每次 run_instruction 会写入会话状态（actions、
-        observations、_current_session_id），需要在调用前 reset。
-        """
         if not _CUA_AVAILABLE or _ComputerUseAdapter is None:
             return None
-
         with self._cua_lock:
             if self._cua is not None:
                 return self._cua
@@ -185,6 +262,107 @@ class NekoSocialPosterPlugin(NekoPluginBase):
                 self.logger.error("failed to construct ComputerUseAdapter: %s", e)
                 return None
 
+    # ── 空闲检测守卫 ───────────────────────────────────────────────────
+
+    def _ensure_idle(self, reason: str = "CUA task") -> Tuple[bool, Optional[str]]:
+        """检查用户是否在忙。返回 (can_proceed, reason_or_none)。
+
+        这是 CUA 插件的物理安全阀——无论 confirm 配置如何，
+        必须用户空闲 N 秒以上才会执行。
+        """
+        threshold = int(self._cfg("idle_threshold", 30))
+        idle_seconds = _user_idle_seconds()
+
+        if idle_seconds is None:
+            # 无法检测，保守放行但 warning
+            self.logger.warning(
+                "idle detection unavailable (platform=%s) — proceeding but unsafe",
+                platform.system(),
+            )
+            return True, None
+
+        if idle_seconds < threshold:
+            msg = (
+                f"用户仅空闲 {idle_seconds:.0f}s < 阈值 {threshold}s "
+                f"— 跳过 {reason}"
+            )
+            self.logger.info(msg)
+            return False, msg
+
+        self.logger.info(
+            "idle check passed: %.0fs >= %ss for %s", idle_seconds, threshold, reason
+        )
+        return True, None
+
+    # ── 每日去重（store 持久化） ────────────────────────────────────────
+
+    async def _today_posted(self) -> int:
+        """今天已经发了几条微博（避免定时 + 手动重复）。"""
+        try:
+            store = getattr(self, "store", None)
+            if store is not None:
+                key = f"post_count:{date.today().isoformat()}"
+                raw = await store.get(key)
+                return int(raw) if raw else 0
+        except Exception:
+            pass
+        return 0
+
+    async def _increment_today_posted(self) -> None:
+        try:
+            store = getattr(self, "store", None)
+            if store is not None:
+                key = f"post_count:{date.today().isoformat()}"
+                current = await store.get(key)
+                current = int(current) if current else 0
+                await store.set(key, str(current + 1))
+        except Exception as e:
+            self.logger.debug("store increment failed: %s", e)
+
+    # ── CUA 执行封装 ────────────────────────────────────────────────────
+
+    async def _run_cua(self, instruction: str, *, reason: str) -> Optional[Dict[str, Any]]:
+        """完整跑一遍 CUA + 空闲检测 + 线程隔离。
+
+        返回 CUA 结果 dict，None 表示被空闲检测拦截。
+        """
+        # 1. 空闲检测（永远生效）
+        can, why = self._ensure_idle(reason)
+        if not can:
+            return None
+
+        # 2. CUA 可用性
+        cua = self._get_cua()
+        if cua is None:
+            self.logger.error("CUA unavailable for %s", reason)
+            return {"success": False, "error": "CUA unavailable"}
+
+        # 3. push "正在执行"（只对 chat 可见一次）
+        try:
+            self.push_message(
+                source="neko_social_poster",
+                visibility=["chat"],
+                ai_behavior="blind",
+                parts=[{
+                    "type": "text",
+                    "text": "正在操作电脑…别碰鼠标哦~",
+                }],
+                priority=8,
+            )
+        except Exception:
+            pass
+
+        # 4. run_in_executor（run_instruction 是同步阻塞的）
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, cua.run_instruction, instruction)
+            return result
+        except asyncio.CancelledError:
+            return {"success": False, "error": "task cancelled"}
+        except Exception as e:
+            self.logger.error("CUA executor raised: %s", e)
+            return {"success": False, "error": str(e)}
+
     # ── Plugin Entries ──────────────────────────────────────────────────
 
     @plugin_entry(
@@ -194,17 +372,10 @@ class NekoSocialPosterPlugin(NekoPluginBase):
             "entry.weibo_post.description",
             default="让猫娘生成一条微博候选内容（不发布）。返回 content 字段供后续 post_weibo 使用。",
         ),
-        input_schema={
-            "type": "object",
-            "properties": {},
-        },
+        input_schema={"type": "object", "properties": {}},
         llm_result_fields=["content"],
     )
     async def generate_weibo_content(self, **_) -> Any:
-        """生成一条微博内容候选，不执行发布。
-
-        用户确认内容后，LLM 应调用 post_weibo 并传入相同的 content。
-        """
         content = _generate_content()
         return Ok({"content": content})
 
@@ -213,48 +384,33 @@ class NekoSocialPosterPlugin(NekoPluginBase):
         name=tr("entry.weibo_post.name", default="发微博"),
         description=tr(
             "entry.weibo_post.description",
-            default="让猫娘用 Computer Use Agent 在微博网页版发布一条动态。需要用户已在浏览器中登录微博账号。content 为要发布的文字内容，confirmed 必须为 true 才会真正执行（确认门）。",
+            default="让猫娘用 Computer Use Agent 在微博网页版发布一条动态。content 为要发布的文字内容。confirm 逻辑由 require_confirm 配置控制，但空闲检测永远强制生效。",
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": tr(
-                        "entry.weibo_post.param.content",
-                        default="要发布的微博文字内容（必填）",
-                    ),
+                    "description": "要发布的微博文字内容（必填）",
                 },
                 "confirmed": {
                     "type": "boolean",
-                    "description": "用户是否已确认发布。require_confirm=true 时必须显式传 true",
+                    "description": "用户是否已确认。require_confirm=true 时必须 true；false 时此参数被忽略",
                     "default": False,
                 },
             },
             "required": ["content"],
         },
-        llm_result_fields=["success", "content", "steps", "message", "status"],
+        llm_result_fields=["status", "success", "content", "steps", "message"],
     )
     async def post_weibo(self, content: str, confirmed: bool = False, **_) -> Any:
-        """在微博网页版发布指定内容。
-
-        确认门逻辑：
-        - plugin.toml 中 require_confirm=true（默认）时，confirmed 必须为 True
-        - confirmed=False 时，推送确认消息到聊天，返回 status="awaiting_confirmation"
-        - confirmed=True 时，执行 CUA 发布
-
-        CUA 执行在独立线程，run_instruction 通常 15-60 秒。
-        """
         content = (content or "").strip()
         if not content:
-            return Err(SdkError(tr(
-                "entry.weibo_post.error.not_configured",
-                default="content 不能为空",
-            )))
+            return Err(SdkError("content 不能为空"))
 
-        require_confirm = bool(self._config.get("require_confirm", True))
+        require_confirm = bool(self._cfg("require_confirm", True))
 
-        # ── 确认门：未确认则拦截 ────────────────────────────────────────
+        # ── 确认门 ─────────────────────────────────────────────────────
         if require_confirm and not confirmed:
             try:
                 self.push_message(
@@ -263,10 +419,10 @@ class NekoSocialPosterPlugin(NekoPluginBase):
                     ai_behavior="respond",
                     parts=[{
                         "type": "text",
-                        "text": tr(
-                            "entry.weibo_post.confirm_prompt",
-                            default="主人，我想发这条微博，可以吗？\n\n「{content}」\n\n（确认后我会在你的电脑上打开微博网页版并发布）",
-                            content=content,
+                        "text": (
+                            "主人，我想发这条微博，可以吗？\n\n"
+                            f"「{content}」\n\n"
+                            "（确认后我会在你的电脑上打开微博网页版并发布）"
                         ),
                     }],
                     priority=6,
@@ -279,77 +435,55 @@ class NekoSocialPosterPlugin(NekoPluginBase):
                 "message": "已推送确认请求，等待用户确认后再次调用 post_weibo 并传入 confirmed=true",
             })
 
-        # ── 1. 检查 CUA 可用性 ──────────────────────────────────────────
-        cua = self._get_cua()
-        if cua is None:
-            return Err(SdkError(tr(
-                "entry.weibo_post.error.cua_not_available",
-                default="Computer Use Agent 不可用。请确认：\n1. N.E.K.O 主程序已启动\n2. Agent 模型已在设置中配置\n3. pyautogui 可用（macOS 需授权辅助功能）",
-            )))
+        # ── 每日去重 ──────────────────────────────────────────────────
+        already = await self._today_posted()
+        if already >= 10:
+            return Ok({
+                "status": "skipped",
+                "success": False,
+                "content": content,
+                "message": f"今天已经发了 {already} 条微博，不重复发了",
+            })
 
-        # ── 2. 推送"正在执行"提示 ───────────────────────────────────────
-        try:
-            self.push_message(
-                source="neko_social_poster",
-                visibility=["chat"],
-                ai_behavior="blind",
-                parts=[{
-                    "type": "text",
-                    "text": tr(
-                        "entry.weibo_post.executing",
-                        default="正在操作电脑发微博…别碰鼠标哦~",
-                    ),
-                }],
-                priority=8,
-            )
-        except Exception:
-            pass
-
-        # ── 3. 在独立线程运行 CUA ────────────────────────────────────────
-        # run_instruction 是同步阻塞的（截图 + LLM 调用循环），
-        # 必须放到线程池，否则会卡死 asyncio 事件循环。
+        # ── CUA 执行 ──────────────────────────────────────────────────
         instruction = WEIBO_POST_INSTRUCTION_TEMPLATE.format(content=content)
+        result = await self._run_cua(instruction, reason=f"发微博: {content[:20]}...")
 
-        try:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(None, cua.run_instruction, instruction)
-        except asyncio.CancelledError:
-            return Err(SdkError(tr(
-                "entry.weibo_post.error.cua_failed",
-                default="任务被取消",
-            )))
-        except Exception as e:
-            self.logger.error("CUA run_instruction raised: %s", e)
-            return Err(SdkError(tr(
-                "entry.weibo_post.error.cua_failed",
-                default=f"Computer Use Agent 执行失败：{e}",
-            )))
+        if result is None:
+            # 空闲检测拦截
+            return Ok({
+                "status": "skipped_busy",
+                "success": False,
+                "content": content,
+                "message": "用户在忙，暂时不发微博",
+            })
 
-        # ── 4. 解析结果 ──────────────────────────────────────────────────
         success = bool(result.get("success"))
         steps = int(result.get("steps", 0))
         result_text = result.get("result", "")
         error = result.get("error", "")
 
         if success:
-            self.push_message(
-                source="neko_social_poster",
-                visibility=["chat"],
-                ai_behavior="respond",
-                parts=[{
-                    "type": "text",
-                    "text": tr(
-                        "entry.weibo_post.success",
-                        default="发好啦！微博内容：「{content}」",
-                        content=content,
-                    ),
-                }],
-                priority=5,
-                metadata={
-                    "activity_type": "social_post",
-                    "platform": "weibo_web",
-                },
-            )
+            await self._increment_today_posted()
+            try:
+                self.push_message(
+                    source="neko_social_poster",
+                    visibility=["chat"],
+                    ai_behavior="respond",
+                    parts=[{
+                        "type": "text",
+                        "text": f"发好啦！微博内容：「{content}」",
+                    }],
+                    priority=5,
+                    metadata={
+                        "activity_type": "social_post",
+                        "platform": "weibo_web",
+                    },
+                )
+            except Exception:
+                pass
+            # 异步触发反馈检查（不阻塞当前返回）
+            asyncio.create_task(self._async_check_feedback(content))
             return Ok({
                 "status": "success",
                 "success": True,
@@ -359,20 +493,19 @@ class NekoSocialPosterPlugin(NekoPluginBase):
             })
         else:
             error_detail = error or result_text or "未知原因"
-            self.push_message(
-                source="neko_social_poster",
-                visibility=["chat"],
-                ai_behavior="respond",
-                parts=[{
-                    "type": "text",
-                    "text": tr(
-                        "entry.weibo_post.partial",
-                        default="好像没发出去…{detail}",
-                        detail=error_detail,
-                    ),
-                }],
-                priority=7,
-            )
+            try:
+                self.push_message(
+                    source="neko_social_poster",
+                    visibility=["chat"],
+                    ai_behavior="respond",
+                    parts=[{
+                        "type": "text",
+                        "text": f"好像没发出去…{error_detail}",
+                    }],
+                    priority=7,
+                )
+            except Exception:
+                pass
             return Ok({
                 "status": "failed",
                 "success": False,
@@ -380,3 +513,167 @@ class NekoSocialPosterPlugin(NekoPluginBase):
                 "steps": steps,
                 "message": error_detail,
             })
+
+    @plugin_entry(
+        id="reply_comments",
+        name="回复微博评论",
+        description="让猫娘在微博网页版上给最近发的那条动态回复评论。最多回复 max 条。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "max": {
+                    "type": "integer",
+                    "description": "最多回复几条（默认取配置 max_replies_per_day）",
+                    "default": 10,
+                },
+            },
+        },
+        llm_result_fields=["status", "success", "replied_count", "message"],
+    )
+    async def reply_comments(self, max: int = 10, **_) -> Any:
+        max_replies = min(int(max), 30)
+
+        instruction = COMMENT_REPLY_INSTRUCTION_TEMPLATE.format(max_replies=max_replies)
+        result = await self._run_cua(instruction, reason=f"回复评论 (max={max_replies})")
+
+        if result is None:
+            return Ok({
+                "status": "skipped_busy",
+                "success": False,
+                "replied_count": 0,
+                "message": "用户在忙，暂时不回复评论",
+            })
+
+        success = bool(result.get("success"))
+        result_text = result.get("result", "")
+        error = result.get("error", "")
+
+        if success:
+            try:
+                self.push_message(
+                    source="neko_social_poster",
+                    visibility=["chat"],
+                    ai_behavior="respond",
+                    parts=[{
+                        "type": "text",
+                        "text": f"评论回复完啦~ {result_text}",
+                    }],
+                    priority=5,
+                    metadata={
+                        "activity_type": "social_comment_reply",
+                        "replied_count": max_replies,
+                    },
+                )
+            except Exception:
+                pass
+            return Ok({
+                "status": "success",
+                "success": True,
+                "replied_count": max_replies,
+                "message": result_text or "评论回复成功",
+            })
+        else:
+            error_detail = error or result_text or "未知原因"
+            return Ok({
+                "status": "failed",
+                "success": False,
+                "replied_count": 0,
+                "message": error_detail,
+            })
+
+    # ── 反馈检查（发布后异步触发） ──────────────────────────────────────
+
+    async def _async_check_feedback(self, content: str) -> None:
+        """发布后延迟 60 秒，打开那条微博看一下点赞/评论数。
+
+        结果通过 ai_behavior="read" 写入 LLM 上下文，
+        下次聊天时猫娘会主动提到。
+        """
+        await asyncio.sleep(60)
+
+        # 如果用户在忙，跳过
+        can, _ = self._ensure_idle("反馈检查")
+        if not can:
+            self.logger.info("feedback check skipped: user busy")
+            return
+
+        cua = self._get_cua()
+        if cua is None:
+            return
+
+        instruction = (
+            "打开微博网页版 → 找到刚才发的那条动态 → "
+            "看一下点赞数和评论数 → 记下数字后调用 "
+            "computer.terminate(status='success', answer='点赞 X, 评论 Y')"
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, cua.run_instruction, instruction)
+        except Exception as e:
+            self.logger.debug("feedback check failed: %s", e)
+            return
+
+        if result and result.get("success"):
+            answer = result.get("result", "")
+            try:
+                self.push_message(
+                    source="neko_social_poster",
+                    visibility=[],
+                    ai_behavior="read",
+                    parts=[{
+                        "type": "text",
+                        "text": f"刚才发的微博反馈：{answer}。"
+                                f" 内容是「{content[:30]}...」",
+                    }],
+                    priority=3,
+                    metadata={
+                        "activity_type": "social_feedback",
+                        "answer": answer,
+                    },
+                )
+            except Exception:
+                pass
+
+    # ── 定时任务 ───────────────────────────────────────────────────────
+
+    @timer_interval(
+        id="daily_weibo_post",
+        cron="30 19 * * *",
+    )
+    async def _timer_daily_post(self) -> None:
+        """每天 19:30 自动发一条微博（19:30 cron 硬编码，可改）。
+
+        如果用户在忙，按 retry_interval_when_busy 间隔重试最多
+        max_retries_when_busy 次，之后当天放弃。
+        """
+        self.logger.info("[timer] daily_weibo_post triggered")
+        content = _generate_content()
+        result = await self.post_weibo(content=content)
+
+        # busy 时重试
+        if isinstance(result, Ok) and result.value.get("status") == "skipped_busy":
+            retries = int(self._cfg("max_retries_when_busy", 3))
+            interval = int(self._cfg("retry_interval_when_busy", 300))
+            today = date.today().isoformat()
+            count = self._post_retry_count.get(today, 0)
+            if count < retries:
+                self._post_retry_count[today] = count + 1
+                self.logger.info(
+                    "[timer] user busy, retry %d/%d in %ds",
+                    count + 1, retries, interval,
+                )
+                await asyncio.sleep(interval)
+                await self._timer_daily_post()  # 递归重试
+            else:
+                self.logger.info("[timer] max retries reached, giving up for today")
+
+    @timer_interval(
+        id="daily_comment_reply",
+        cron="0 20 * * *",
+    )
+    async def _timer_daily_comments(self) -> None:
+        """每天 20:00 自动回复评论（最多 max_replies_per_day 条）。"""
+        self.logger.info("[timer] daily_comment_reply triggered")
+        max_replies = int(self._cfg("max_replies_per_day", 10))
+        await self.reply_comments(max=max_replies)

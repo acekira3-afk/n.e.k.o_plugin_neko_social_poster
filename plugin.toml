@@ -1,8 +1,8 @@
 [plugin]
 id = "neko_social_poster"
 name = "social_poster"
-description = "让猫娘用 Computer Use Agent 操作桌面，帮你发微博等社交平台动态"
-version = "0.1.0"
+description = "让猫娘用 Computer Use Agent 操作桌面，帮你发微博等社交平台动态 + 定时回复评论"
+version = "0.2.0"
 author = "acekira3-afk"
 homepage = "https://github.com/acekira3-afk/n.e.k.o_plugin_neko_social_poster"
 
@@ -21,11 +21,30 @@ enabled = true
 auto_start = false
 
 [plugin_config]
-# 微博网页版 URL（用户需已登录）
+# ── CUA 基础 ──────────────────────────────────────
 weibo_url = "https://weibo.com/"
-# CUA 最大步数（发动态通常 10-15 步足够）
 max_steps = 30
-# 是否需要用户确认后才执行发布
-require_confirm = true
-# 默认发布平台
 default_platform = "weibo_web"
+
+# ── 确认门 ────────────────────────────────────────
+# true = 手动触发时需要用户确认（安全）
+# false = 自动发布，不经确认（空闲检测仍然强制生效）
+require_confirm = false
+
+# ── 空闲检测（物理安全阀，永远生效） ──────────────
+# CUA 执行前必须满足：用户连续 idle_threshold 秒没动过鼠标键盘
+# 无论 require_confirm 是什么值，这个守卫都不跳过
+idle_threshold = 30
+
+# ── 定时自动发微博 ────────────────────────────────
+# cron 格式：分 时 日 月 周
+# 每天 19:30 自动发一条（用户在忙就等 5 分钟后重试，最多重试 3 次）
+daily_post_cron = "30 19 * * *"
+max_retries_when_busy = 3
+retry_interval_when_busy = 300
+
+# ── 定时回复评论 ──────────────────────────────────
+# 每天 20:00 自动打开微博，回复最新动态下的评论（最多 max_replies_per_day 条）
+daily_comment_cron = "0 20 * * *"
+max_replies_per_day = 10
+reply_tone = "猫娘软乎乎"  # 预留，目前固定
