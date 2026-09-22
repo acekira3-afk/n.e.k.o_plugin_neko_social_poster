@@ -1,8 +1,8 @@
 [plugin]
 id = "neko_social_poster"
 name = "social_poster"
-description = "让猫娘用 Computer Use Agent 操作桌面，帮你发微博等社交平台动态 + 定时回复评论"
-version = "0.2.0"
+description = "让猫娘用 Computer Use Agent 操作桌面，帮你发微博/Twitter/小红书/B站动态 + 定时回复评论 + 激励闭环"
+version = "0.3.0"
 author = "acekira3-afk"
 homepage = "https://github.com/acekira3-afk/n.e.k.o_plugin_neko_social_poster"
 
@@ -22,9 +22,26 @@ auto_start = false
 
 [plugin_config]
 # ── CUA 基础 ──────────────────────────────────────
-weibo_url = "https://weibo.com/"
 max_steps = 30
 default_platform = "weibo_web"
+
+# ── 多平台支持（P1） ──────────────────────────────
+# 可用平台：weibo_web / twitter_web / xiaohongshu_web / bilibili_dynamic
+# 定时任务使用 default_platform，手动调用可在 platform 参数中指定
+# enabled_platforms 控制哪些平台在 LLM 工具列表中可见（逗号分隔）
+enabled_platforms = "weibo_web,twitter_web,xiaohongshu_web,bilibili_dynamic"
+
+# ── CUA 路径缓存（P1） ─────────────────────────────
+# 首次操作走完整 VLM 步骤（~15步），成功后从 cots 提取关键坐标
+# 后续操作注入缓存坐标，缩减到 ~3-5 步
+# cache_expiry_days 天后缓存自动过期，重新走完整流程
+cache_expiry_days = 7
+
+# ── 激励闭环（P1） ────────────────────────────────
+# 发布后 feedback_check_delay 秒，CUA 自动读取点赞/评论数
+# 写入 store（social_stats:{date}）+ 推送心情文本到 LLM context
+# 点赞多→开心，少→有点失落，影响猫娘后续语气
+feedback_check_delay = 60
 
 # ── 确认门 ────────────────────────────────────────
 # true = 手动触发时需要用户确认（安全）
@@ -36,15 +53,18 @@ require_confirm = false
 # 无论 require_confirm 是什么值，这个守卫都不跳过
 idle_threshold = 30
 
-# ── 定时自动发微博 ────────────────────────────────
+# ── 定时自动发动态 ────────────────────────────────
 # cron 格式：分 时 日 月 周
 # 每天 19:30 自动发一条（用户在忙就等 5 分钟后重试，最多重试 3 次）
 daily_post_cron = "30 19 * * *"
 max_retries_when_busy = 3
 retry_interval_when_busy = 300
 
+# ── 每日发布上限 ────────────────────────────────────
+daily_post_limit = 10
+
 # ── 定时回复评论 ──────────────────────────────────
-# 每天 20:00 自动打开微博，回复最新动态下的评论（最多 max_replies_per_day 条）
+# 每天 20:00 自动打开平台，回复最新动态下的评论（最多 max_replies_per_day 条）
 daily_comment_cron = "0 20 * * *"
 max_replies_per_day = 10
-reply_tone = "猫娘软乎乎"  # 预留，目前固定
+reply_tone = "猫娘软乎乎"
