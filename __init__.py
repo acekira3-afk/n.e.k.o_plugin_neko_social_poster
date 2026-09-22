@@ -563,23 +563,37 @@ class NekoSocialPosterPlugin(NekoPluginBase):
         return True, None
 
     # ── store 工具方法 ─────────────────────────────────────────────────
+    # 优先用 Proposal 3 的 NekoPluginBase.store_get/set 便捷方法（已含 Result 解包），
+    # host 版本未升级时 fallback 到直接 store.get/set。
 
-    async def _store_get(self, key: str) -> Optional[str]:
+    async def _store_get(self, key: str, default: Any = None) -> Any:
         try:
+            if hasattr(self, "store_get") and callable(self.store_get):
+                return await self.store_get(key, default=default)
             store = getattr(self, "store", None)
             if store is not None:
-                return await store.get(key)
+                result = await store.get(key, default)
+                # 兼容 Result[T, E] 包装（Proposal 3 之前 host 的 store.get 可能返回）
+                if hasattr(result, "is_ok") and callable(result.is_ok):
+                    if result.is_ok():
+                        return getattr(result, "value", default)
+                    return default
+                return result
         except Exception:
             pass
-        return None
+        return default
 
-    async def _store_set(self, key: str, value: str) -> None:
+    async def _store_set(self, key: str, value: Any) -> bool:
         try:
+            if hasattr(self, "store_set") and callable(self.store_set):
+                return await self.store_set(key, value)
             store = getattr(self, "store", None)
             if store is not None:
                 await store.set(key, value)
+                return True
         except Exception as e:
             self.logger.debug("store set failed for %s: %s", key, e)
+        return False
 
     async def _today_posted(self) -> int:
         """今天已经发了几条动态（避免定时 + 手动重复）。"""
