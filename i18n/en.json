@@ -1,0 +1,17 @@
+{
+  "entry.weibo_post.name": "Post Weibo",
+  "entry.weibo_post.description": "Have Neko post a status on Weibo web using Computer Use Agent. Requires the user to be already logged into Weibo in their browser. content is optional; if omitted Neko will generate based on mood.",
+  "entry.weibo_post.param.content": "Weibo text content to post (optional; auto-generated if omitted)",
+  "entry.weibo_post.param.require_confirm": "Whether to ask user for confirmation before executing, default true",
+  "entry.weibo_post.error.not_configured": "Computer Use Agent not initialized. Please configure the Agent model in N.E.K.O.",
+  "entry.weibo_post.error.cua_failed": "Computer Use Agent failed: {error}",
+  "entry.weibo_post.error.cua_not_available": "Computer Use Agent unavailable (pyautogui or Agent model not ready)",
+  "entry.weibo_post.generating": "Okay~ let me think of something to post today…",
+  "entry.weibo_post.confirm_prompt": "{MASTER_NAME}, can I post this to Weibo?\n\n\"{content}\"\n\n(After you confirm I'll open Weibo web and post it)",
+  "entry.weibo_post.confirmed": "Yay! Posting now~",
+  "entry.weibo_post.cancelled": "Aww… maybe next time then",
+  "entry.weibo_post.executing": "Posting Weibo… don't touch the mouse~",
+  "entry.weibo_post.success": "Done! Weibo says: \"{content}\"",
+  "entry.weibo_post.partial": "I think it went through but I'm not sure… can you check?",
+  "entry.weibo_post.announce": "{MASTER_NAME}, I just posted to Weibo~ go check it out!"
+}

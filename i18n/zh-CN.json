@@ -1,0 +1,17 @@
+{
+  "entry.weibo_post.name": "发微博",
+  "entry.weibo_post.description": "让猫娘用 Computer Use Agent 在微博网页版发布一条动态。需要用户已在浏览器中登录微博账号。content 参数为要发布的文字内容（可选）；不传则由猫娘根据心情自动生成。",
+  "entry.weibo_post.param.content": "要发布的微博文字内容（可选，不传则自动生成）",
+  "entry.weibo_post.param.require_confirm": "是否需要用户确认后才执行发布，默认 true",
+  "entry.weibo_post.error.not_configured": "Computer Use Agent 未初始化，请确认 N.E.K.O 的 Agent 模型已配置",
+  "entry.weibo_post.error.cua_failed": "Computer Use Agent 执行失败：{error}",
+  "entry.weibo_post.error.cua_not_available": "Computer Use Agent 不可用（pyautogui 或 Agent 模型未就绪）",
+  "entry.weibo_post.generating": "好~让我想想今天发什么好…",
+  "entry.weibo_post.confirm_prompt": "主人，我想发这条微博，可以吗？\n\n「{content}」\n\n（确认后我会在你的电脑上打开微博网页版并发布）",
+  "entry.weibo_post.confirmed": "好嘞！这就去发~",
+  "entry.weibo_post.cancelled": "呜…那下次再发吧",
+  "entry.weibo_post.executing": "正在操作电脑发微博…别碰鼠标哦~",
+  "entry.weibo_post.success": "发好啦！微博内容：「{content}」",
+  "entry.weibo_post.partial": "好像发出去了，但我不太确定…你帮我看看？",
+  "entry.weibo_post.announce": "主人，我刚发了条微博哦~去看看吧！"
+}

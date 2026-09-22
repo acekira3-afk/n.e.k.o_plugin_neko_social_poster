@@ -1,0 +1,31 @@
+[plugin]
+id = "neko_social_poster"
+name = "social_poster"
+description = "让猫娘用 Computer Use Agent 操作桌面，帮你发微博等社交平台动态"
+version = "0.1.0"
+author = "acekira3-afk"
+homepage = "https://github.com/acekira3-afk/n.e.k.o_plugin_neko_social_poster"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+
+[plugin.store]
+enabled = true
+
+[plugin.i18n]
+default_locale = "zh-CN"
+locales = ["zh-CN", "en"]
+
+[plugin_runtime]
+enabled = true
+auto_start = false
+
+[plugin_config]
+# 微博网页版 URL（用户需已登录）
+weibo_url = "https://weibo.com/"
+# CUA 最大步数（发动态通常 10-15 步足够）
+max_steps = 30
+# 是否需要用户确认后才执行发布
+require_confirm = true
+# 默认发布平台
+default_platform = "weibo_web"
